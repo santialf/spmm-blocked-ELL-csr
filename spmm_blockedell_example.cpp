@@ -293,6 +293,8 @@ int main(int argc, char *argv[]) {
     // Host problem definition
     int   A_ell_blocksize = 16;
     
+    //--------------------------------------------------------------------------
+    // Pad matrix with extra rows and columns to be multiple of block size
     int * rowPtr_pad;
     int remainder = A_num_rows % A_ell_blocksize;
     if (remainder != 0) {
@@ -308,7 +310,13 @@ int main(int argc, char *argv[]) {
         rowPtr_pad = rowPtr;
     }   
 
-    long int split = 1280;
+    //--------------------------------------------------------------------------
+    // Split matrix into 2 csr's
+    int k = 16;
+    int blocks_per_part = (A_num_rows/A_ell_blocksize) / k;
+    if ((A_num_rows/A_ell_blocksize) % k != 0)
+        blocks_per_part += 1;
+    long int split = blocks_per_part*(k/2)*A_ell_blocksize;
     long int A1_rows = split, A2_rows = A_num_rows - split;
 
     int *rowPtr_part1 = new int[A1_rows + 1];
@@ -329,6 +337,9 @@ int main(int argc, char *argv[]) {
         colIndex1[j] = colIndex[j];
         values1[j] = values[j];
     }
+
+    //--------------------------------------------------------------------------
+    // Build blocked ell of the second csr
     int   A_ell_cols      = findMaxNnz(rowPtr_part2, colIndex, A2_rows, A_ell_blocksize);
     double   A_num_blocks    = (double)A_ell_cols * (double)A2_rows /
                            (A_ell_blocksize * A_ell_blocksize);
@@ -343,7 +354,9 @@ int main(int argc, char *argv[]) {
     int   *hA_columns     = createBlockIndex(rowPtr_part2, colIndex, A2_rows, A_ell_blocksize, A_ell_cols);
     __half *hA_values     = createValueIndex(rowPtr_part2, colIndex, values, hA_columns, A2_rows, A_ell_blocksize, A_ell_cols);
 
-    __half *hB            = createRandomArray(B_size);
+    //--------------------------------------------------------------------------
+    // Create dense vectors for spmm
+    __half *hB2            = createRandomArray(B_size);
     float *hB1            = createRandomArray1(B_size);
     float *hC1            = new float[(long int) A1_rows*B_num_cols*sizeof(float)];
     __half *hC2            = new __half[(long int) A2_rows*B_num_cols*sizeof(__half)];
@@ -365,23 +378,23 @@ int main(int argc, char *argv[]) {
     }
     //--------------------------------------------------------------------------
     // Device memory management blocked ELL
-    int    *dA_columns;
-    __half *dA_values, *dB, *dC;
-    CHECK_CUDA( cudaMalloc((void**) &dA_columns, (long int) A_num_blocks * sizeof(int)) )
-    CHECK_CUDA( cudaMalloc((void**) &dA_values,
+    int    *dA2_columns;
+    __half *dA2_values, *dB2, *dC2;
+    CHECK_CUDA( cudaMalloc((void**) &dA2_columns, (long int) A_num_blocks * sizeof(int)) )
+    CHECK_CUDA( cudaMalloc((void**) &dA2_values,
                                     (long int) A_ell_cols * A2_rows * sizeof(__half)) )
-    CHECK_CUDA( cudaMalloc((void**) &dB, (long int) B_size * sizeof(__half)) )
-    CHECK_CUDA( cudaMalloc((void**) &dC, (long int) A2_rows*B_num_cols * sizeof(__half)) )
+    CHECK_CUDA( cudaMalloc((void**) &dB2, (long int) B_size * sizeof(__half)) )
+    CHECK_CUDA( cudaMalloc((void**) &dC2, (long int) A2_rows*B_num_cols * sizeof(__half)) )
 
-    CHECK_CUDA( cudaMemcpy(dA_columns, hA_columns,
+    CHECK_CUDA( cudaMemcpy(dA2_columns, hA_columns,
                            (long int) A_num_blocks * sizeof(int),
                            cudaMemcpyHostToDevice) )
-    CHECK_CUDA( cudaMemcpy(dA_values, hA_values,
+    CHECK_CUDA( cudaMemcpy(dA2_values, hA_values,
                            (long int) A_ell_cols * A2_rows * sizeof(__half),
                            cudaMemcpyHostToDevice) )
-    CHECK_CUDA( cudaMemcpy(dB, hB, (long int) B_size * sizeof(__half),
+    CHECK_CUDA( cudaMemcpy(dB2, hB2, (long int) B_size * sizeof(__half),
                            cudaMemcpyHostToDevice) )
-    CHECK_CUDA( cudaMemcpy(dC, hC2, (long int) A2_rows*B_num_cols * sizeof(__half),
+    CHECK_CUDA( cudaMemcpy(dC2, hC2, (long int) A2_rows*B_num_cols * sizeof(__half),
                            cudaMemcpyHostToDevice) )
     //--------------------------------------------------------------------------
     // Device memory management CSR
@@ -411,37 +424,37 @@ int main(int argc, char *argv[]) {
     //--------------------------------------------------------------------------
     // CUSPARSE APIs blocked ELL
     cusparseHandle_t     handle = NULL;
-    cusparseSpMatDescr_t matA;
-    cusparseDnMatDescr_t matB, matC;
+    cusparseSpMatDescr_t matA2;
+    cusparseDnMatDescr_t matB2, matC2;
     void*                dBuffer    = NULL;
     size_t               bufferSize = 0;
     CHECK_CUSPARSE( cusparseCreate(&handle) )
     // Create sparse matrix A in blocked ELL format
     CHECK_CUSPARSE( cusparseCreateBlockedEll(
-                                      &matA,
+                                      &matA2,
                                       A2_rows, A_num_cols, A_ell_blocksize,
-                                      A_ell_cols, dA_columns, dA_values,
+                                      A_ell_cols, dA2_columns, dA2_values,
                                       CUSPARSE_INDEX_32I,
                                       CUSPARSE_INDEX_BASE_ZERO, CUDA_R_16F) )
     // Create dense matrix B
-    CHECK_CUSPARSE( cusparseCreateDnMat(&matB, A_num_cols, B_num_cols, ldb, dB,
+    CHECK_CUSPARSE( cusparseCreateDnMat(&matB2, A_num_cols, B_num_cols, ldb, dB2,
                                         CUDA_R_16F, CUSPARSE_ORDER_COL) )
     // Create dense matrix C
-    CHECK_CUSPARSE( cusparseCreateDnMat(&matC, A2_rows, B_num_cols, A2_rows, dC,
+    CHECK_CUSPARSE( cusparseCreateDnMat(&matC2, A2_rows, B_num_cols, A2_rows, dC2,
                                         CUDA_R_16F, CUSPARSE_ORDER_COL) )
     // allocate an external buffer if needed
     CHECK_CUSPARSE( cusparseSpMM_bufferSize(
                                  handle,
                                  CUSPARSE_OPERATION_NON_TRANSPOSE,
                                  CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                 &alpha, matA, matB, &beta, matC, CUDA_R_32F,
+                                 &alpha, matA2, matB2, &beta, matC2, CUDA_R_32F,
                                  CUSPARSE_SPMM_ALG_DEFAULT, &bufferSize) )
     CHECK_CUDA( cudaMalloc(&dBuffer, bufferSize) )
 
     CHECK_CUSPARSE( cusparseSpMM(handle,
 			    	CUSPARSE_OPERATION_NON_TRANSPOSE,
 				CUSPARSE_OPERATION_NON_TRANSPOSE,
-				&alpha, matA, matB, &beta, matC, CUDA_R_32F,
+				&alpha, matA2, matB2, &beta, matC2, CUDA_R_32F,
 				CUSPARSE_SPMM_ALG_DEFAULT, dBuffer) )
     cudaDeviceSynchronize();
     //--------------------------------------------------------------------------
@@ -483,7 +496,7 @@ int main(int argc, char *argv[]) {
         CHECK_CUSPARSE( cusparseSpMM(handle,
                                     CUSPARSE_OPERATION_NON_TRANSPOSE,
                                     CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                    &alpha, matA, matB, &beta, matC, CUDA_R_32F,
+                                    &alpha, matA2, matB2, &beta, matC2, CUDA_R_32F,
                                     CUSPARSE_SPMM_ALG_DEFAULT, dBuffer) )
         cudaDeviceSynchronize();
         CHECK_CUSPARSE( cusparseSpMM(handle1,
@@ -511,19 +524,20 @@ int main(int argc, char *argv[]) {
     printf(" Time (seconds):\t%.6f\n", searchTime);
 
     // destroy matrix/vector descriptors
-    CHECK_CUSPARSE( cusparseDestroySpMat(matA) )
+    CHECK_CUSPARSE( cusparseDestroySpMat(matA2) )
     CHECK_CUSPARSE( cusparseDestroySpMat(matA1) )
-    CHECK_CUSPARSE( cusparseDestroyDnMat(matB) )
+    CHECK_CUSPARSE( cusparseDestroyDnMat(matB2) )
     CHECK_CUSPARSE( cusparseDestroyDnMat(matB1) )
-    CHECK_CUSPARSE( cusparseDestroyDnMat(matC) )
+    CHECK_CUSPARSE( cusparseDestroyDnMat(matC2) )
     CHECK_CUSPARSE( cusparseDestroyDnMat(matC1) )
     CHECK_CUSPARSE( cusparseDestroy(handle) )
+    CHECK_CUSPARSE( cusparseDestroy(handle1) )
     //--------------------------------------------------------------------------
     // device result check
     CHECK_CUDA( cudaMemcpy(hC1, dC1, (long int) A1_rows*B_num_cols * sizeof(float),
                            cudaMemcpyDeviceToHost) )
-    CHECK_CUDA( cudaMemcpy(hC2, dC, (long int) A2_rows*B_num_cols * sizeof(__half),
-			   cudaMemcpyDeviceToHost) )
+    CHECK_CUDA( cudaMemcpy(hC2, dC2, (long int) A2_rows*B_num_cols * sizeof(__half),
+			               cudaMemcpyDeviceToHost) )
 
     /*std::ofstream outputFile("output.txt");
     for(int i=0; i<A1_rows*B_num_cols; i++)
@@ -535,15 +549,20 @@ int main(int argc, char *argv[]) {
     //--------------------------------------------------------------------------
     // device memory deallocation
     CHECK_CUDA( cudaFree(dBuffer) )
-    CHECK_CUDA( cudaFree(dA_columns) )
-    CHECK_CUDA( cudaFree(dA_values) )
-    CHECK_CUDA( cudaFree(dB) )
-    CHECK_CUDA( cudaFree(dC) )
+    CHECK_CUDA( cudaFree(dBuffer1) )
+    CHECK_CUDA( cudaFree(dA2_columns) )
+    CHECK_CUDA( cudaFree(dA1_columns) )
+    CHECK_CUDA( cudaFree(dA2_values) )
+    CHECK_CUDA( cudaFree(dA1_values) )
+    CHECK_CUDA( cudaFree(dB2) )
+    CHECK_CUDA( cudaFree(dB1) )
+    CHECK_CUDA( cudaFree(dC2) )
     CHECK_CUDA( cudaFree(dC1) )
     
     delete[] hA_columns;
     delete[] hA_values;
-    delete[] hB;
+    delete[] hB1;
+    delete[] hB2;
     delete[] hC1;
     delete[] hC2;
     return EXIT_SUCCESS;
